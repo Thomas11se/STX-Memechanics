@@ -208,3 +208,195 @@
     (ok proposal-id)
   )
 )
+
+
+;; Vote on Proposal with Block Height Check
+(define-public (vote-on-proposal 
+  (proposal-id uint)
+)
+  (let 
+    (
+      ;; Current block height
+      (current-block (var-get current-block-height))
+
+      ;; Retrieve proposal information
+      (proposal 
+        (unwrap! 
+          (map-get? governance-proposals {proposal-id: proposal-id}) 
+          (err u113)
+        )
+      )
+    )
+    ;; Check if voting is still open based on block height
+    (asserts! 
+      (< current-block (get voting-deadline proposal)) 
+      (err u114)
+    )
+
+    ;; Additional voting logic here
+    (ok true)
+  )
+)
+
+;;  Mint new tokens (owner only)
+(define-public (mint-tokens 
+  (amount uint) 
+  (recipient principal)
+)
+  (begin
+    ;; Check that caller is contract owner
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+
+    ;; Check that minting won't exceed max supply
+    (asserts! 
+      (<= (+ (var-get total-supply) amount) (var-get max-supply))
+      ERR-MAX-SUPPLY-REACHED
+    )
+
+    ;; Mint tokens to recipient
+    (try! (ft-mint? memecoin amount recipient))
+
+    ;; Update total supply
+    (var-set total-supply (+ (var-get total-supply) amount))
+
+    (ok true)
+  )
+)
+
+;;  Token burning mechanism
+(define-public (burn-tokens 
+  (amount uint)
+)
+  (begin
+    ;; Burn tokens from sender
+    (try! (ft-burn? memecoin amount tx-sender))
+
+    ;; Update total supply
+    (var-set total-supply (- (var-get total-supply) amount))
+
+    (ok true)
+  )
+)
+
+
+
+
+;;  Time-locked token vesting mechanism
+;; Define the vesting schedules map
+(define-map vesting-schedules
+  principal
+  {
+    total-amount: uint,
+    claimed-amount: uint,
+    start-block: uint,
+    cliff-block: uint,
+    end-block: uint
+  }
+)
+
+;; Create a new vesting schedule for a beneficiary
+(define-public (create-vesting-schedule
+  (beneficiary principal)
+  (amount uint)
+  (cliff-period uint)
+  (vesting-duration uint)
+)
+  (let
+    (
+      (current-block (var-get current-block-height))
+      (cliff-block (+ current-block cliff-period))
+      (end-block (+ current-block vesting-duration))
+    )
+    ;; Check that caller is contract owner
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+
+    ;; Check that we have enough tokens to allocate
+    (asserts! 
+      (<= (+ (var-get total-supply) amount) (var-get max-supply))
+      ERR-MAX-SUPPLY-REACHED
+    )
+
+    ;; Create vesting schedule
+    (map-set vesting-schedules
+      beneficiary
+      {
+        total-amount: amount,
+        claimed-amount: u0,
+        start-block: current-block,
+        cliff-block: cliff-block,
+        end-block: end-block
+      }
+    )
+
+    ;; Mint tokens to contract (held in escrow)
+    (try! (as-contract (ft-mint? memecoin amount (as-contract tx-sender))))
+
+    ;; Update total supply
+    (var-set total-supply (+ (var-get total-supply) amount))
+
+    (ok true)
+  )
+)
+
+;; Claim vested tokens
+(define-public (claim-vested-tokens)
+  (let
+    (
+      (current-block (var-get current-block-height))
+
+      ;; Get vesting schedule
+      (vesting-info
+        (unwrap!
+          (map-get? vesting-schedules tx-sender)
+          (err u120) ;; No vesting schedule found
+        )
+      )
+
+      ;; Calculate claimable amount
+      (claimable-amount
+        (if (< current-block (get cliff-block vesting-info))
+          ;; Before cliff, nothing is claimable
+          u0
+          (if (>= current-block (get end-block vesting-info))
+            ;; After vesting period, everything is claimable
+            (- (get total-amount vesting-info) (get claimed-amount vesting-info))
+            ;; During vesting period, calculate linear vesting
+            (let
+              (
+                (total-vesting-blocks (- (get end-block vesting-info) (get start-block vesting-info)))
+                (blocks-vested (- current-block (get start-block vesting-info)))
+                (total-vested-amount (/ (* (get total-amount vesting-info) blocks-vested) total-vesting-blocks))
+              )
+              (- total-vested-amount (get claimed-amount vesting-info))
+            )
+          )
+        )
+      )
+    )
+    ;; Check if there's anything to claim
+    (asserts! (> claimable-amount u0) (err u121)) ;; Nothing to claim
+
+    ;; Transfer the claimable tokens to the beneficiary
+    (try!
+      (as-contract
+        (ft-transfer?
+          memecoin
+          claimable-amount
+          (as-contract tx-sender)
+          tx-sender
+        )
+      )
+    )
+
+    ;; Update the claimed amount
+    (map-set vesting-schedules
+      tx-sender
+      (merge
+        vesting-info
+        {claimed-amount: (+ (get claimed-amount vesting-info) claimable-amount)}
+      )
+    )
+
+    (ok claimable-amount)
+  )
+)
